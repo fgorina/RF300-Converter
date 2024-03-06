@@ -1,11 +1,33 @@
 
-This directory is intended for PlatformIO Test Runner and project tests.
+RF300 Frequency to PWM
 
-Unit Testing is a software testing method by which individual units of
-source code, sets of one or more MCU program modules together with associated
-control data, usage procedures, and operating procedures, are tested to
-determine whether they are fit for use. Unit testing finds problems early
-in the development cycle.
+This adevice reads a signal from pin IN_GPIO (13), detects
+it's frequency and converts it to an angle that may be positive
+or negative.
 
-More information about PlatformIO Unit Testing:
-- https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
+Frequency for angle 0 is defined in variable center_f in hz
+Step in Hz/degree is defined in hz_degree
+Angle range is +/- angle_range
+
+Angle value is converted to a duty cycle with 
+
+    0 -> -angle_range
+    1024 -> +angle_range
+
+and used for a pwm at pin v_PWM (5)
+
+If device is Heltec WiFiKit 32 data of frequency and angle is hown in the OLED Screen.
+
+OLED Screen is turned off if not activaded for 60s
+
+Pin TOUCH_GPIO (12) is used as a capacitive touch to enable the screen for 60s
+
+There is code to connect to a SignalK Server and update steering.rudderAngle but
+is disconnected as pypilot does it itself.
+
+Esternal circuits necessary for interfacing the RF300 to the PyPilot motor controller is shown in the acompanying circuit.
+
+Depending at how good is the signal, just a voltage follower after a high pass filter is enough. 
+
+PWM output is uset to drive a transistor to use the motor controller voltages and filtered with a secon pass low pass filter.
+

@@ -1,25 +1,39 @@
-#include <heltec.h>
+
 #include <EEPROM.h>
 #include <ArduinoWebsockets.h>
 #include "WiFi.h"
-#include <Time.h>
+//#include <Time.h>
 #include <ArduinoJson.h>
 #include <ArduinoJson.hpp>
 #include <HTTPClient.h>
 #include <ESPmDNS.h>
 
+#include <driver/dac.h>
+
+#define HELTEC
+
+#ifdef HELTEC
+  #include <heltec.h>
+#endif
 
 #define DEBUG false
-#define DEBUG_1 false
+#define DEBUG_1 true
+#define DEBUG_ISR false
 
 #define EEPROM_SIZE 512
 
-#define ONBOARD_LED 25
-#define IN_GPIO 13
+#ifdef HELTEC
+  #define IN_GPIO 13
 
-#define GENERATOR 27
-#define V_OUT 26
-#define V_PWM 17
+  #define V_PWM 14
+  #define ONBOARD_LED 25
+#else
+  #define IN_GPIO 16
+  #define V_PWM 5
+  #define ONBOARD_LED 2
+#endif
+
+#define TOUCH_GPIO 12
 #define PWM_CHAN 0
 #define AVG_SAMPLES 1000
 
@@ -42,17 +56,25 @@ char skpath[100] = "/signalk/v1/stream?subscribe=none";
 
 // Frequency to angle conversion
 
-const float center_f = 3400.0;
+const double center_f = 3000.0;
+const double hz_degree = 20.0;
+const double angle_range = 30.0; // +/- 30 degrees
+
 unsigned long last = micros();
 int samples = 0;
 unsigned long ac_period = 0; 
+double f = 0;
+double angle = 0;
 char buffer[256];
 
-// Some data for the frequency generator
+// Disable display
 
-unsigned long sg_period = floor(1000000.0 / center_f / 2.0);
-int sg_state = 0;
-hw_timer_t *generator_timer = NULL;
+unsigned int touch_level = 30;
+unsigned long timeout = 60000;  
+unsigned long last_touched = 0;
+bool display_on = true;
+
+
 
 using namespace websockets;
 
@@ -61,7 +83,7 @@ bool mdnsDone = false; // Will be true when we have a server
 bool wifi_connect = false;
 int enabled = 0; // 0 Deshabilita les accions fins que s'ha rebut un command
 WebsocketsClient client;
-int socketState = -4; // -5 does not use WiFi, -4 -> Before connecting to WiFi, -3, -2.Connectingauthorized, 2-> Connected and authorized
+int socketState = -5; // Change to -4 if want connect -5 does not use WiFi, -4 -> Before connecting to WiFi, -3, -2.Connection authorized, 2-> Connected and authorized
 
 String me = "vessels.self";
 char token[256] = "";
@@ -74,7 +96,7 @@ char bigBuffer[1024] = "";
 TaskHandle_t task_pres;
 TaskHandle_t task_empty;
 TaskHandle_t taskNetwork;
-TaskHandle_t taskDistance;
+
 
 int ledState = 0;
 int ledOn = 0;
@@ -84,7 +106,12 @@ int ledOff = 100;
 
 
 void IRAM_ATTR ISR()
-{
+{  
+  #if DEBUG_ISR
+    Serial.print(".");
+  #endif
+
+
 
   unsigned long m = micros();
   unsigned long period = m - last;
@@ -92,22 +119,6 @@ void IRAM_ATTR ISR()
   samples += 1;
   last = m;
 }
-
-
-
-void IRAM_ATTR ISR_GENERATOR()
-{
-
-  digitalWrite(GENERATOR, !digitalRead(GENERATOR));
-  /*if(sg_state){
-    REG_WRITE(GPIO_OUT_W1TS_REG, BIT27);
-  }else{
-    REG_WRITE(GPIO_OUT_W1TC_REG, BIT27);
-  }
-  sg_state = !sg_state;
-*/
-}
-
 
 // LEDs
 
@@ -162,14 +173,12 @@ void ledTask(void *parameter)
 #include "signalk.h"
 
 
-
 // Sets output voltage proportional to the rudder angle
 // For testing uses DAC and PWM
 
-void setVoltage(float v) {
- 
+void setVoltage(double v) {
+         
   unsigned int i = floor(v * 1024.0);
-  dacWrite(V_OUT, i);
   ledcWrite(PWM_CHAN, i);
 
 }
@@ -177,40 +186,69 @@ void setVoltage(float v) {
 // This writes the screen and computes frequency ajd angle.
 void presentationTask(void *parameter)
 {
+  float f = 0.0;
   while (true)
   {
     if (samples >= AVG_SAMPLES)
     {
-      float period = 2.0 * float(ac_period) / float(samples);
+      int oldsamples = samples;
+      unsigned long old_ac_period = ac_period;
+
+      double period = 2.0 * double(ac_period) / double(samples);
       samples = 0;
       ac_period = 0;
 
-      float f = float(1000000) / float(period);
-      Heltec.display->clear();
+      f = double(1000000) / double(period);
 
-      float delta = f - center_f;
-      float angle = delta / 20.0;
-      float rads = angle / 180.0 * PI;
+      if(DEBUG_1){
+        Serial.print("Ac Period "); Serial.print(old_ac_period); Serial.print(" Samples "); Serial.print(oldsamples); Serial.print(" f "); Serial.println(f);
+      }
+
+      double delta = f - center_f;
+      angle = round(delta / hz_degree);
+      double rads = angle / 180.0 * PI;
       sendData(rads);
 
       // -30.0 es 0, 30.0 es 255
 
-      float v = (angle + 35.0) / 70.0;
+      double v = (angle + angle_range) / (2 * angle_range);
+      v = max(min(1.0, v), 0.0);
+      if(DEBUG_1){
+        Serial.print("Angle ");Serial.print(angle);Serial.print(" Voltage "); Serial.println(v);
+      }
       setVoltage(v);
-      sprintf(buffer, "f: %0.f Hz", f);
-      Heltec.display->drawString(0, 0, String(buffer));
 
-      sprintf(buffer, "a: %0.f º %0.2f r", angle, rads);
-      Heltec.display->drawString(0, 20, String(buffer));
-      Heltec.display->display(); //
-
-      // Here is for the level meter
-
-      sprintf(buffer, "level %0.2f %", level);
-      Heltec.display->drawString(0, 40, String(buffer));
-      Heltec.display->display(); //
     }
-    vTaskDelay(50);
+
+      #ifdef HELTEC
+        Heltec.display->clear();
+
+        sprintf(buffer, "f: %0.f Hz", round(f));  
+        Heltec.display->drawString(0, 0, String(buffer));
+
+        sprintf(buffer, "a: %0.f º", angle);
+        Heltec.display->drawString(0, 20, String(buffer));
+
+        if(socketState == -5){
+          Heltec.display->drawString(0, 40, "Not Connected");
+        }else if(socketState == -4){
+          Heltec.display->drawString(0, 40, "Disconnected");
+        }
+        else if(socketState == -3){
+          Heltec.display->drawString(0, 40, "Connecting");
+        }else if(socketState == -2){
+          Heltec.display->drawString(0, 40, "WiFi OK");
+        }else if(socketState == 0){
+          Heltec.display->drawString(0, 40, "SK OK");
+        }else if(socketState == 2){
+          Heltec.display->drawString(0, 40, "SK Authd");
+        }else{
+          sprintf(buffer , "SS %d", socketState);
+          Heltec.display->drawString(0, 40, buffer);
+        }
+        Heltec.display->display(); //
+      #endif
+    vTaskDelay(50); // May be adjusted for necessity 
   }
 }
 
@@ -235,10 +273,9 @@ void emptyTask(void *parameter)
   }
 }
 
-// Connection data to SignalK
-void loadEEPROM()
-{
+
   // Load Data from EEPROM
+void loadEEPROM(){
 
   float f1;
   float f2;
@@ -249,7 +286,7 @@ void loadEEPROM()
   EEPROM.get(0, f1);
   EEPROM.get(4, f2);
 
-  if (isnan(f1) || isnan(f2) || f1 == 0.0 || f2 == 0.0)
+  if (isnan(f1) || isnan(f2) || f1 == 0.0 || f2 == 0.0 )
   {
 
     f1 = 1.0;
@@ -306,70 +343,60 @@ void loadEEPROM()
 }
 void setup()
 {
-  // put your setup code here, to run once:
-
-  Heltec.begin(true, false, true);
 
   Serial.begin(115200);
   
   pinMode(IN_GPIO, INPUT);
-
-  pinMode(END_GPIO, INPUT);
-  pinMode(TRIGGER_GPIO, OUTPUT);
-
-
-  pinMode(GENERATOR, OUTPUT);
-
   ledcSetup(PWM_CHAN, 10000, 10);
   ledcAttachPin(V_PWM, PWM_CHAN);
 
-  for (int i = 0; i < MAX_DISTANCE_SAMPLES; i++)
-  {
-    distance_samples[i] = 0.0;
-  }
+  //loadEEPROM();
 
-  loadEEPROM();
-
+#ifdef HELTEC
+  Heltec.begin(true, false, true);
   Heltec.display->setTextAlignment(TEXT_ALIGN_LEFT);
   Heltec.display->setFont(ArialMT_Plain_24);
 
+#endif
+ 
+
+  sprintf(buffer, "a: %0.f º %0.2f r", 0.0, 0.0);
   xTaskCreatePinnedToCore(presentationTask, "Presentation", 4000, NULL, 1, &task_pres, 0);
   xTaskCreatePinnedToCore(emptyTask, "Empty", 4000, NULL, 1, &task_empty, 1);
   xTaskCreatePinnedToCore(networkTask, "TaskNetwork", 4000, NULL, 1, &taskNetwork, 0);
-  xTaskCreatePinnedToCore(distanceTask, "DistanceNetwork", 6000, NULL, 1, &taskDistance, 0);
-
-  attachInterrupt(IN_GPIO, ISR, CHANGE);
-  attachInterrupt(END_GPIO, ISR_DISTANCE, CHANGE);
-
  
+  attachInterrupt(IN_GPIO, ISR, CHANGE);
 
-  sg_period = floor(1000000.0 / (center_f  ) / 2.0);
+  last_touched = millis();
 
-  generator_timer = timerBegin(1, 80, true);
-  timerAttachInterrupt(generator_timer, &ISR_GENERATOR, true);
-  timerAlarmWrite(generator_timer, sg_period , true);
-  timerAlarmEnable(generator_timer);
+
+  if(DEBUG_1){
+    Serial.print("Center f ");Serial.print(center_f);Serial.print(" Hz, Step "); Serial.print(hz_degree);Serial.print(" Hz/deg"); 
+  }
+
+
 }
-
-float mangle = -30.0;
-float delta = 1.0;
-
 void loop()
 {
+  unsigned long t = millis();
+  if ((t - last_touched) > timeout && display_on){
 
-  Serial.print("Rudder to "); Serial.println(mangle);
-
-  sg_period = floor(1000000.0 / (center_f + (mangle * 20.0)) / 2.0);
-  timerAlarmWrite(generator_timer, sg_period , true);
-  mangle += delta;
-
-  if (mangle > 30.0){
-    delta = - delta;
+    if(DEBUG){
+      Serial.println("Display Off)");
+    }
+    Heltec.display->displayOff();
+    display_on = false;  
   }
 
-  if (mangle < -30.0){
-    delta = -delta;
-  }
 
-  vTaskDelay(1000);
+  if(touchRead(TOUCH_GPIO) < touch_level){
+
+    if(!display_on){
+      Heltec.display->displayOn();
+      display_on = true;
+    }
+    last_touched = millis();
+  }
+  
+  vTaskDelay(10);
 }
